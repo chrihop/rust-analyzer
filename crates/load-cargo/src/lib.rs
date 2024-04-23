@@ -17,6 +17,7 @@ use itertools::Itertools;
 use proc_macro_api::{MacroDylib, ProcMacroServer};
 use project_model::{CargoConfig, PackageRoot, ProjectManifest, ProjectWorkspace};
 use span::Span;
+use tracing::{instrument, Level};
 use vfs::{file_set::FileSetConfig, loader::Handle, AbsPath, AbsPathBuf, VfsPath};
 
 pub struct LoadCargoConfig {
@@ -50,6 +51,7 @@ pub fn load_workspace_at(
     load_workspace(workspace, &cargo_config.extra_env, load_config)
 }
 
+#[instrument(skip_all)]
 pub fn load_workspace(
     ws: ProjectWorkspace,
     extra_env: &FxHashMap<String, String>,
@@ -333,9 +335,7 @@ fn load_crate_graph(
     vfs: &mut vfs::Vfs,
     receiver: &Receiver<vfs::loader::Message>,
 ) -> RootDatabase {
-    let (ProjectWorkspace::Cargo { toolchain, target_layout, .. }
-    | ProjectWorkspace::Json { toolchain, target_layout, .. }
-    | ProjectWorkspace::DetachedFile { toolchain, target_layout, .. }) = ws;
+    let ProjectWorkspace { toolchain, target_layout, .. } = ws;
 
     let lru_cap = std::env::var("RA_LRU_CAP").ok().and_then(|it| it.parse::<usize>().ok());
     let mut db = RootDatabase::new(lru_cap);
@@ -352,6 +352,7 @@ fn load_crate_graph(
                 }
             }
             vfs::loader::Message::Loaded { files } | vfs::loader::Message::Changed { files } => {
+                let _p = tracing::span!(Level::INFO, "LoadCargo::load_file_contents").entered();
                 for (path, contents) in files {
                     vfs.set_file_contents(path.into(), contents);
                 }
