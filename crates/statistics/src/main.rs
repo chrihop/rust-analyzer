@@ -1,19 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-use std::cell::RefCell;
-use std::error::Error;
 use std::ops::Deref;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard};
-use ide::{Analysis, StructureNode, StructureNodeKind, SymbolKind};
+use std::sync::{Arc, Mutex};
+use ide::{Analysis, LineIndex, StructureNode, StructureNodeKind, SymbolKind};
 use clap::{
     Command, arg, value_parser
 };
 use regex::Regex;
-use syntax::TextSize;
+use syntax::{SourceFile, TextSize};
 use toml::Table;
-
 
 enum RustType {
     Struct,
@@ -25,7 +21,9 @@ enum RustType {
 
 struct Context {
     path: PathBuf,
+    src: Option<SourceFile>,
     raw: Vec<StructureNode>,
+    line_index: Option<triomphe::Arc<LineIndex>>,
     structs: BTreeMap<usize, Arc<Mutex<RustStruct>>>,
     functions: BTreeMap<usize, Arc<RustFunction>>,
     statics: BTreeMap<usize, Arc<RustStatic>>,
@@ -37,7 +35,9 @@ impl Context {
     fn new(path: &PathBuf) -> Self {
         Context {
             path: path.clone(),
+            src: None,
             raw: Vec::new(),
+            line_index: None,
             structs: BTreeMap::new(),
             functions: BTreeMap::new(),
             statics: BTreeMap::new(),
@@ -46,23 +46,53 @@ impl Context {
         }
     }
 
-    fn load(&mut self, nodes: Vec<StructureNode>) {
-        self.raw = nodes;
+    fn load(&mut self) {
+        let code = fs::read_to_string(&self.path).unwrap_or_else(|e| {
+            log::error!("Error reading file: {:?} ({})", &self.path, e);
+            "".to_string()
+        });
+
+        let (analysis, file_id) = Analysis::from_single_file(code);
+
+        self.raw = match analysis.file_structure(file_id).ok() {
+            Some(s) => s,
+            None => {
+                log::error!("No structure found for file: {:?}", &self.path);
+                Vec::new()
+            }
+        };
+
+        self.src = match analysis.parse(file_id).ok() {
+            Some(s) => Some(s),
+            None => {
+                log::error!("No source found for file: {:?}", &self.path);
+                None
+            }
+        };
+
+        self.line_index = match analysis.file_line_index(file_id).ok() {
+            Some(l) => Some(l.clone()),
+            None => {
+                log::error!("No line index found for file: {:?}", &self.path);
+                None
+            }
+        };
     }
 
-    fn reset(&mut self) {
-        self.raw.clear();
-        self.structs.clear();
-        self.functions.clear();
-        self.statics.clear();
-        self.impls.clear();
-        self.orphan_fields.clear();
-    }
-
-    fn insert(&mut self, index: usize, node: &StructureNode) {
+    fn insert(&mut self, index: usize) {
+        let node = &self.raw[index];
+        log::trace!("[{:}] : {:?}", index, node);
         match node.kind {
             StructureNodeKind::SymbolKind(kind) => match kind {
                 SymbolKind::Struct => {
+                    self.structs.insert(index, Arc::new(Mutex::new(
+                        <RustStruct as FromContext<StructureNode>>::from(node, self))));
+                }
+                SymbolKind::Enum => {
+                    self.structs.insert(index, Arc::new(Mutex::new(
+                        <RustStruct as FromContext<StructureNode>>::from(node, self))));
+                }
+                SymbolKind::Variant => {
                     self.structs.insert(index, Arc::new(Mutex::new(
                         <RustStruct as FromContext<StructureNode>>::from(node, self))));
                 }
@@ -107,27 +137,26 @@ impl Context {
     }
 
     fn parse_pass(&mut self, filter: &BTreeSet<SymbolKind>) {
-        let mut nodes: Vec<(usize, StructureNode)> = Vec::new();
+        let mut selection: Vec<usize> = Vec::new();
         for (i, node) in self.raw.iter().enumerate() {
             let kind = match &node.kind {
                 StructureNodeKind::SymbolKind(k) => k,
                 _ => continue,
             };
             if filter.contains(kind) {
-                nodes.push((i, node.clone()));
+                selection.push(i);
             }
         }
 
-        for (i, node) in nodes {
-            log::trace!("Node: {:?}", node);
-            self.insert(i, &node);
+        for i in selection {
+            self.insert(i);
         }
     }
 
     fn parse(&mut self) {
         let passes = vec![
-            BTreeSet::from([SymbolKind::Struct, SymbolKind::Trait]),
-            BTreeSet::from([SymbolKind::Impl]),
+            BTreeSet::from([SymbolKind::Struct, SymbolKind::Trait, SymbolKind::Enum]),
+            BTreeSet::from([SymbolKind::Variant, SymbolKind::Impl]),
             BTreeSet::from([SymbolKind::Field, SymbolKind::Function, SymbolKind::Method]),
             BTreeSet::from([SymbolKind::Static]),
         ];
@@ -164,11 +193,15 @@ impl Context {
         let path = self.path.to_str().unwrap();
         for (i, (_, f)) in self.functions.iter().enumerate() {
             let tokens = format!("{:?}", f.tokens);
-            out.push_str(&format!("{: <16} | {: <4} | {: >6} | ", path, i, tokens));
+            out.push_str(&format!("{: <16} | {: <4} | {: >6} | {: >6} |",
+                                  path, i, tokens, f.lines));
             if let Some(st) = f.structure.clone() {
                 out.push_str(&format!("{: <16}::", st.lock().unwrap().node.name));
+                out.push_str(&format!("{: <16} | {: <32}", f.node.name, f.signature));
+            } else {
+                out.push_str(&format!("{: <34} | {: <32}", f.node.name, f.signature));
             }
-            out.push_str(&format!("{: <16} | {}", f.node.name, f.signature));
+
             if let Some(t) = f.impl_trait.clone() {
                 out.push_str(&format!(" | impl {}", t));
             }
@@ -218,7 +251,7 @@ fn format_contexts(contexts: &Vec<Arc<Context>>) -> String {
 
 struct RustCodeNode {
     pub(crate) name: String,
-    pub(crate) ty: RustType,
+    pub(crate) _ty: RustType,
 }
 
 struct RustField {
@@ -233,6 +266,7 @@ struct RustFunction {
     pub(crate) impl_trait: Option<String>,
     pub(crate) signature: String,
     pub(crate) tokens: TextSize,
+    pub(crate) lines: usize,
 }
 
 struct RustStruct {
@@ -246,6 +280,7 @@ struct RustStatic {
     pub(crate) def: String,
 }
 
+#[allow(dead_code)]
 struct RustImpl {
     pub(crate) node: RustCodeNode,
     pub(crate) target: Arc<Mutex<RustStruct>>,
@@ -259,7 +294,7 @@ impl RustCodeNode {
             _ => panic!("Unknown node kind: {:?}", node.kind),
         };
         let ty = match kind {
-            SymbolKind::Struct | SymbolKind::Trait => RustType::Struct,
+            SymbolKind::Struct | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Variant => RustType::Struct,
             SymbolKind::Function | SymbolKind::Method => RustType::Function,
             SymbolKind::Field => RustType::Field,
             SymbolKind::Static => RustType::Static,
@@ -268,7 +303,7 @@ impl RustCodeNode {
         };
         RustCodeNode {
             name: node.label.clone(),
-            ty,
+            _ty: ty,
         }
     }
 }
@@ -285,7 +320,11 @@ impl FromContext<StructureNode> for RustField {
             structure: None,
         };
         if let Some(parent) = node.parent {
-            let st = ctx.structs.get(&parent).unwrap();
+            let st = ctx.structs.get(&parent).unwrap_or_else(||{
+                log::error!("Cannot find Node[{:}] {:?}) in structs list.",
+                    parent, ctx.raw[parent]);
+                panic!();
+            });
             e.structure = Some(st.clone());
         }
         e
@@ -294,12 +333,20 @@ impl FromContext<StructureNode> for RustField {
 
 impl FromContext<StructureNode> for RustFunction {
     fn from(node: &StructureNode, ctx: &Context) -> Self {
+        let lines = match ctx.line_index.clone() {
+            Some(l) => {
+                l.lines(node.node_range).count().checked_sub(1).unwrap_or(0)
+            }
+            None => 0,
+        };
+
         let mut f = RustFunction {
             node: RustCodeNode::from(node),
             structure: None,
             impl_trait: None,
             signature: node.detail.as_ref().unwrap().clone(),
-            tokens: node.node_range.len().clone()
+            tokens: node.node_range.len().clone(),
+            lines,
         };
         if let Some(parent) = node.parent {
             if let Some(implementation) = ctx.impls.get(&parent) {
@@ -338,7 +385,7 @@ impl FromContext<StructureNode> for RustImpl {
                 let o = Arc::new(Mutex::new(RustStruct {
                     node: RustCodeNode {
                         name: target.clone(),
-                        ty: RustType::Struct,
+                        _ty: RustType::Struct,
                     },
                     fields: Vec::new(),
                     functions: Vec::new(),
@@ -357,7 +404,7 @@ impl FromContext<StructureNode> for RustImpl {
 }
 
 impl FromContext<StructureNode> for RustStruct {
-    fn from(node: &StructureNode, ctx: &Context) -> Self {
+    fn from(node: &StructureNode, _ctx: &Context) -> Self {
         RustStruct {
             node: RustCodeNode::from(node),
             fields: Vec::new(),
@@ -377,20 +424,12 @@ impl FromContext<StructureNode> for RustStatic {
 
 fn parse(path: &PathBuf) -> Arc<Context> {
     let mut ctx = Context::new(path);
-    let code = fs::read_to_string(path).unwrap_or_else(|e| {
-        log::error!("Error reading file: {:?} ({})", path, e);
-        "".to_string()
-    });
-    let (analysis, file_id) = Analysis::from_single_file(code);
-    let structure = analysis.file_structure(file_id).unwrap();
-
-    ctx.load(structure);
+    ctx.load();
     ctx.parse();
     Arc::new(ctx)
 }
 
 fn main() {
-    env_logger::init();
     let cmd = Command::new("statistics")
         .bin_name("statistics")
         .about("Prints statistics about the codebase")
@@ -409,7 +448,10 @@ fn main() {
     let matches = cmd.get_matches();
     if matches.get_flag("verbose") {
         env_logger::builder().filter_level(log::LevelFilter::Trace).init();
+    } else {
+        env_logger::builder().filter_level(log::LevelFilter::Info).init();
     }
+
 
     if let Some(path) = matches.get_one::<PathBuf>("rs") {
         // single file mode

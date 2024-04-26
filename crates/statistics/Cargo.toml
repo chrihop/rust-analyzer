@@ -21,6 +21,7 @@ regex = "1.10.4"
 log = "*"
 env_logger = "*"
 toml = "*"
+triomphe = "*"
 
 
 [lints]
